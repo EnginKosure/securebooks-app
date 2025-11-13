@@ -1,9 +1,9 @@
 replicaCount: 2
 
 image:
-  repository: ghcr.io/enginkosure/securebooks
+  repository: nginx
   pullPolicy: IfNotPresent
-  tag: main-latest
+  tag: latest
 
 imagePullSecrets: []
 nameOverride: ""
