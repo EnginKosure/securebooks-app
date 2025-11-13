@@ -1,0 +1,9 @@
+apiVersion: v2
+name: securebooks
+description: A secure FastAPI application with PostgreSQL backend
+type: application
+version: 0.1.0
+appVersion: "1.0"
+maintainers:
+  - name: EnginKosure
+    email: engin@example.com
