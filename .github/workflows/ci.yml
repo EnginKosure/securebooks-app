@@ -1,0 +1,181 @@
+name: CI/CD Pipeline
+
+on:
+  push:
+    branches:
+      - main
+      - develop
+  pull_request:
+    branches:
+      - main
+      - develop
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository_owner }}/securebooks
+
+jobs:
+  build-and-scan:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+      security-events: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to Container Registry
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=ref,event=branch
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=sha,prefix={{branch}}-
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: ./app
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Run Trivy vulnerability scanner
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
+          format: 'sarif'
+          output: 'trivy-results.sarif'
+          severity: 'CRITICAL,HIGH'
+
+      - name: Upload Trivy results to GitHub Security tab
+        uses: github/codeql-action/upload-sarif@v2
+        if: always()
+        with:
+          sarif_file: 'trivy-results.sarif'
+          category: 'trivy'
+
+      - name: Trivy scan summary
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
+          format: 'table'
+          severity: 'CRITICAL,HIGH'
+
+  lint:
+    runs-on: ubuntu-latest
+    continue-on-error: true  # Don't fail if linting issues found
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install flake8 black isort
+
+      - name: Lint with flake8
+        run: |
+          flake8 app/securebooks --count --select=E9,F63,F7,F82 --show-source --statistics || true
+          flake8 app/securebooks --count --exit-zero --max-complexity=10 --max-line-length=127 --statistics || true
+
+      - name: Check code formatting with black
+        run: black --check app/securebooks || true
+
+      - name: Check import sorting with isort
+        run: isort --check-only app/securebooks || true
+
+  security-scan:
+    runs-on: ubuntu-latest
+    continue-on-error: true  # Optional security checks, don't block deployment
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+
+      - name: Install security tools
+        run: |
+          pip install bandit safety
+
+      - name: Run Bandit security scan
+        run: |
+          bandit -r app/securebooks -f json -o bandit-report.json || true
+          bandit -r app/securebooks -f txt || true
+
+      - name: Check for known vulnerabilities with safety
+        run: |
+          safety check --json > safety-report.json || true
+          safety check || true
+
+  helm-lint:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Lint Helm chart
+        uses: helm/chart-testing-action@v2
+        with:
+          charts: helm/securebooks
+
+  # driftctl: Skipped for personal repo (requires cloud credentials)
+  # Uncomment if using cloud infrastructure (AWS/Azure/GCP)
+  # driftctl:
+  #   runs-on: ubuntu-latest
+  #   if: github.ref == 'refs/heads/main'
+  #   continue-on-error: true
+  #   steps:
+  #     - name: Checkout code
+  #       uses: actions/checkout@v4
+  #     - name: Run driftctl security scan
+  #       uses: snyk/driftctl-action@main
+  #       env:
+  #         DRIFTCTL_GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+  #       with:
+  #         args: scan
+
+  notify:
+    runs-on: ubuntu-latest
+    needs: [build-and-scan, lint, security-scan, helm-lint]
+    if: always()
+    steps:
+      - name: Check build status
+        run: |
+          if [ "${{ needs.build-and-scan.result }}" = "failure" ] || \
+             [ "${{ needs.lint.result }}" = "failure" ] || \
+             [ "${{ needs.security-scan.result }}" = "failure" ] || \
+             [ "${{ needs.helm-lint.result }}" = "failure" ]; then
+            echo "CI/CD Pipeline has failures"
+            exit 1
+          else
+            echo "CI/CD Pipeline passed"
+          fi
